@@ -301,8 +301,8 @@ ngx_http_statsd_handler(ngx_http_request_t *r)
 			metric_type = "ms";
 		} else if (stat.type == STATSD_TYPE_TIMING_MS) {
 			metric_type = "ms";
-			sample_rate_fmt = "%V:%.3f|%s|@0.%02d";
-			full_rate_fmt = "%V:%.3f|%s";
+			sample_rate_fmt = "%V:%f|%s|@0.%02d";
+			full_rate_fmt = "%V:%f|%s";
 		} else {
 			metric_type = NULL;
 		}
