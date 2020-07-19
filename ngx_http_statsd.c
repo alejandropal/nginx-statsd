@@ -13,10 +13,11 @@
 #include <ngx_http.h>
 #include <nginx.h>
 
-#define STATSD_DEFAULT_PORT 			8125
+#define STATSD_DEFAULT_PORT                    8125
 
-#define STATSD_TYPE_COUNTER	0x0001
-#define STATSD_TYPE_TIMING  0x0002
+#define STATSD_TYPE_COUNTER     0x0001
+#define STATSD_TYPE_TIMING      0x0002
+#define STATSD_TYPE_TIMING_MS   0x0003
 
 /*
  * Max StartsD message length = 1472
@@ -78,11 +79,12 @@ static char *ngx_http_statsd_set_server(ngx_conf_t *cf, ngx_command_t *cmd, void
 static char *ngx_http_statsd_add_stat(ngx_conf_t *cf, ngx_command_t *cmd, void *conf, ngx_uint_t type);
 static char *ngx_http_statsd_add_count(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_statsd_add_timing(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static char *ngx_http_statsd_add_timing_ms(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 
 static ngx_str_t ngx_http_statsd_key_get_value(ngx_http_request_t *r, ngx_http_complex_value_t *cv, ngx_str_t v);
 static ngx_str_t ngx_http_statsd_key_value(ngx_str_t *str);
-static ngx_uint_t ngx_http_statsd_metric_get_value(ngx_http_request_t *r, ngx_http_complex_value_t *cv, ngx_uint_t v);
-static ngx_uint_t ngx_http_statsd_metric_value(ngx_str_t *str);
+static ngx_uint_t ngx_http_statsd_metric_get_value(ngx_http_request_t *r, ngx_http_complex_value_t *cv, ngx_uint_t v, ngx_uint_t type);
+static ngx_uint_t ngx_http_statsd_metric_value(ngx_str_t *str, ngx_uint_t type);
 static ngx_flag_t ngx_http_statsd_valid_get_value(ngx_http_request_t *r, ngx_http_complex_value_t *cv, ngx_flag_t v);
 static ngx_flag_t ngx_http_statsd_valid_value(ngx_str_t *str);
 
@@ -119,6 +121,13 @@ static ngx_command_t  ngx_http_statsd_commands[] = {
 	  NGX_HTTP_LOC_CONF_OFFSET,
 	  0,
 	  NULL },
+    
+    { ngx_string("statsd_timing_ms"),
+      NGX_HTTP_SRV_CONF|NGX_HTTP_SIF_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LIF_CONF|NGX_CONF_TAKE23,
+      ngx_http_statsd_add_timing_ms,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
 
       ngx_null_command
 };
@@ -176,7 +185,7 @@ ngx_http_statsd_key_value(ngx_str_t *value)
 };
 
 static ngx_uint_t
-ngx_http_statsd_metric_get_value(ngx_http_request_t *r, ngx_http_complex_value_t *cv, ngx_uint_t v)
+ngx_http_statsd_metric_get_value(ngx_http_request_t *r, ngx_http_complex_value_t *cv, ngx_uint_t v, ngx_uint_t type)
 {
 	ngx_str_t val;
 	if (cv == NULL) {
@@ -187,11 +196,11 @@ ngx_http_statsd_metric_get_value(ngx_http_request_t *r, ngx_http_complex_value_t
 		return 0;
 	};
 
-	return ngx_http_statsd_metric_value(&val);
+	return ngx_http_statsd_metric_value(&val, type);
 };
 
 static ngx_uint_t
-ngx_http_statsd_metric_value(ngx_str_t *value)
+ngx_http_statsd_metric_value(ngx_str_t *value, ngx_uint_t type)
 {
 	ngx_int_t n, m;
 
@@ -200,7 +209,7 @@ ngx_http_statsd_metric_value(ngx_str_t *value)
 	};
 
 	/* Hack to convert milliseconds to a number. */
-	if (value->len > 4 && value->data[value->len - 4] == '.') {
+	if (type != STATSD_TYPE_TIMING_MS && value->len > 4 && value->data[value->len - 4] == '.') {
 		n = ngx_atoi(value->data, value->len - 4);
 		m = ngx_atoi(value->data + (value->len - 3), 3);
 		return (ngx_uint_t) ((n * 1000) + m);
@@ -241,6 +250,8 @@ ngx_http_statsd_handler(ngx_http_request_t *r)
 {
     u_char                    line[STATSD_MAX_STR], *p;
     const char *              metric_type;
+    const char *              sample_rate_fmt;
+    const char *              full_rate_fmt;
     ngx_http_statsd_conf_t   *ulcf;
 	ngx_statsd_stat_t 		 *stats;
 	ngx_statsd_stat_t		  stat;
@@ -272,7 +283,7 @@ ngx_http_statsd_handler(ngx_http_request_t *r)
 		s = ngx_http_statsd_key_get_value(r, stat.ckey, stat.key);
 		ngx_escape_statsd_key(s.data, s.data, s.len);
 
-		n = ngx_http_statsd_metric_get_value(r, stat.cmetric, stat.metric);
+		n = ngx_http_statsd_metric_get_value(r, stat.cmetric, stat.metric, stat.type);
 		b = ngx_http_statsd_valid_get_value(r, stat.cvalid, stat.valid);
 
 		if (b == 0 || s.len == 0 || n <= 0) {
@@ -281,23 +292,30 @@ ngx_http_statsd_handler(ngx_http_request_t *r)
          	continue;
 		};
 
+		sample_rate_fmt = "%V:%d|%s|@0.%02d";
+		full_rate_fmt = "%V:%d|%s";
+
 		if (stat.type == STATSD_TYPE_COUNTER) {
 			metric_type = "c";
 		} else if (stat.type == STATSD_TYPE_TIMING) {
 			metric_type = "ms";
+		} else if (stat.type == STATSD_TYPE_TIMING_MS) {
+			metric_type = "ms";
+			sample_rate_fmt = "%V:%.3f|%s|@0.%02d";
+			full_rate_fmt = "%V:%.3f|%s";
 		} else {
 			metric_type = NULL;
 		}
 
 		if (metric_type) {
 			if (ulcf->sample_rate < 100) {
-				p = ngx_snprintf(line, STATSD_MAX_STR, "%V:%d|%s|@0.%02d", &s, n, metric_type, ulcf->sample_rate);
+				p = ngx_snprintf(line, STATSD_MAX_STR, sample_rate_fmt, &s, n, metric_type, ulcf->sample_rate);
 			} else {
-				p = ngx_snprintf(line, STATSD_MAX_STR, "%V:%d|%s", &s, n, metric_type);
+				p = ngx_snprintf(line, STATSD_MAX_STR, full_rate_fmt, &s, n, metric_type);
 			}
 			ngx_http_statsd_udp_send(ulcf->endpoint, line, p - line);
-		}
-	}
+        }
+    }
 
     return NGX_OK;
 }
@@ -738,7 +756,7 @@ ngx_http_statsd_add_stat(ngx_conf_t *cf, ngx_command_t *cmd, void *conf, ngx_uin
 	}
 
 	if (metric_cv.lengths == NULL) {
-		n = ngx_http_statsd_metric_value(&value[2]);
+		n = ngx_http_statsd_metric_value(&value[2], type);
 		if (n < 0) {
 			ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "invalid parameter \"%V\"", &value[2]);
 			return NGX_CONF_ERROR;
@@ -791,6 +809,12 @@ static char *
 ngx_http_statsd_add_timing(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
 	return ngx_http_statsd_add_stat(cf, cmd, conf, STATSD_TYPE_TIMING);
+}
+
+static char *
+ngx_http_statsd_add_timing_ms(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+	return ngx_http_statsd_add_stat(cf, cmd, conf, STATSD_TYPE_TIMING_MS);
 }
 
 static ngx_int_t
